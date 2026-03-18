@@ -9,6 +9,7 @@ from typing import (
     Awaitable,
     Union,
 )
+import argparse
 import os
 import httpx
 from contextlib import asynccontextmanager
@@ -61,6 +62,14 @@ SUPERSET_USERNAME = os.getenv("SUPERSET_USERNAME")
 SUPERSET_PASSWORD = os.getenv("SUPERSET_PASSWORD")
 ACCESS_TOKEN_STORE_PATH = os.path.join(os.path.dirname(__file__), ".superset_token")
 
+# Superset 6.0+ API endpoints (stable in 4.x–6.x)
+SECURITY_LOGIN_ENDPOINT = "/api/v1/security/login"
+SECURITY_REFRESH_ENDPOINT = "/api/v1/security/refresh"
+SECURITY_CSRF_ENDPOINT = "/api/v1/security/csrf_token/"
+ME_ENDPOINT = "/api/v1/me/"
+# Auth provider: "db" = database (username/password). Required for Superset 6.0.
+AUTH_PROVIDER = "db"
+
 # Initialize FastAPI app for handling additional web endpoints if needed
 app = FastAPI(title="Superset MCP Server")
 
@@ -96,11 +105,76 @@ def save_access_token(token: str):
         logger.warning(f"Warning: Could not save access token: {e}")
 
 
+def ensure_token_loaded(ctx: Context) -> None:
+    """
+    If the current context has no access token, try loading from disk.
+    HTTP/streamable-http mode may use a new session per request, so in-memory
+    token from a previous authenticate_user call can be missing; loading from
+    file keeps auth valid across tool calls.
+    """
+    try:
+        superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    except (LookupError, AttributeError):
+        return
+    if superset_ctx.access_token:
+        return
+    stored = load_stored_token()
+    if not stored:
+        return
+    superset_ctx.access_token = stored
+    superset_ctx.client.headers.update({"Authorization": f"Bearer {stored}"})
+    logger.debug("Loaded access token from file for this request")
+
+
+def _normalize_access_token_response(data: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract access_token from login/refresh response.
+    Superset 4.x–6.x may return { "access_token": "..." } or { "result": { "access_token": "..." } }.
+    """
+    if not data:
+        return None
+    token = data.get("access_token")
+    if token:
+        return token
+    result = data.get("result")
+    if isinstance(result, dict):
+        return result.get("access_token")
+    return None
+
+
+def _normalize_csrf_response(data: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract CSRF token from response.
+    Handles both { "result": "token" } and { "csrf_token": "token" } or raw string result.
+    """
+    if not data:
+        return None
+    token = data.get("result")
+    if token is not None:
+        return str(token) if not isinstance(token, dict) else token.get("csrf_token")
+    return data.get("csrf_token")
+
+
+def _normalize_api_response(data: Any) -> Any:
+    """
+    Normalize API response for Superset 4.x–6.x compatibility.
+    Many list/detail endpoints wrap payload in "result"; we return the full response
+    but tools can rely on consistent structure. For generic make_api_request we pass through.
+    """
+    if data is None:
+        return data
+    if isinstance(data, dict) and "result" in data and "count" not in data and "ids" not in data:
+        # Single-result style: { "result": { ... } } -> keep full for backward compatibility
+        pass
+    return data
+
+
 @asynccontextmanager
 async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     """Manage application lifecycle for Superset integration"""
     logger.info("Initializing Superset context...")
 
+    logger.info(f"Superset base URL: {SUPERSET_BASE_URL}")
     # Create HTTP client
     client = httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=30.0)
 
@@ -115,9 +189,9 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
         client.headers.update({"Authorization": f"Bearer {stored_token}"})
         logger.info("Using stored access token")
 
-        # Verify token validity
+        # Verify token validity (Superset 6.0 uses same /api/v1/me/)
         try:
-            response = await client.get("/api/v1/me/")
+            response = await client.get(ME_ENDPOINT)
             if response.status_code != 200:
                 logger.info(
                     f"Stored token is invalid (status {response.status_code}). Will need to re-authenticate."
@@ -158,6 +232,7 @@ def requires_auth(
 
     @wraps(func)
     async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
+        ensure_token_loaded(ctx)
         superset_ctx: SupersetContext = ctx.request_context.lifespan_context
 
         if not superset_ctx.access_token:
@@ -252,10 +327,10 @@ async def get_csrf_token(ctx: Context) -> Optional[str]:
     client = superset_ctx.client
 
     try:
-        response = await client.get("/api/v1/security/csrf_token/")
+        response = await client.get(SECURITY_CSRF_ENDPOINT)
         if response.status_code == 200:
             data = response.json()
-            csrf_token = data.get("result")
+            csrf_token = _normalize_csrf_response(data)
             superset_ctx.csrf_token = csrf_token
             return csrf_token
         else:
@@ -287,6 +362,7 @@ async def make_api_request(
         params: Optional query parameters
         auto_refresh: Whether to auto-refresh token on 401
     """
+    ensure_token_loaded(ctx)
     superset_ctx: SupersetContext = ctx.request_context.lifespan_context
     client = superset_ctx.client
 
@@ -326,7 +402,12 @@ async def make_api_request(
             "error": f"API request failed: {response.status_code} - {response.text}"
         }
 
-    return response.json()
+    try:
+        data = response.json()
+    except Exception as e:
+        return {"error": f"Invalid JSON response: {e}"}
+
+    return _normalize_api_response(data)
 
 
 # ===== Authentication Tools =====
@@ -351,7 +432,7 @@ async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
 
     try:
         # Make a simple API call to test if token is valid (get user info)
-        response = await superset_ctx.client.get("/api/v1/me/")
+        response = await superset_ctx.client.get(ME_ENDPOINT)
 
         if response.status_code == 200:
             return {"valid": True}
@@ -383,8 +464,8 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
         return {"error": "No access token to refresh. Please authenticate first."}
 
     try:
-        # Use the refresh endpoint to get a new token
-        response = await superset_ctx.client.post("/api/v1/security/refresh")
+        # Superset 6.0: POST /api/v1/security/refresh (same as 4.x)
+        response = await superset_ctx.client.post(SECURITY_REFRESH_ENDPOINT)
 
         if response.status_code != 200:
             return {
@@ -392,7 +473,7 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
             }
 
         data = response.json()
-        access_token = data.get("access_token")
+        access_token = _normalize_access_token_response(data)
 
         if not access_token:
             return {"error": "No access token returned from refresh"}
@@ -462,13 +543,13 @@ async def superset_auth_authenticate_user(
         }
 
     try:
-        # Get access token directly using the security login API endpoint
+        # Superset 6.0: POST /api/v1/security/login with provider="db" (database auth)
         response = await superset_ctx.client.post(
-            "/api/v1/security/login",
+            SECURITY_LOGIN_ENDPOINT,
             json={
                 "username": username,
                 "password": password,
-                "provider": "db",
+                "provider": AUTH_PROVIDER,
                 "refresh": refresh,
             },
         )
@@ -479,7 +560,7 @@ async def superset_auth_authenticate_user(
             }
 
         data = response.json()
-        access_token = data.get("access_token")
+        access_token = _normalize_access_token_response(data)
 
         if not access_token:
             return {"error": "No access token returned"}
@@ -488,6 +569,14 @@ async def superset_auth_authenticate_user(
         save_access_token(access_token)
         superset_ctx.access_token = access_token
         superset_ctx.client.headers.update({"Authorization": f"Bearer {access_token}"})
+
+        # Some Superset setups require session cookies for /api/v1/dashboard/ and /chart/ to return data (see apache/superset#25890)
+        if getattr(response, "cookies", None):
+            try:
+                for name, value in response.cookies.items():
+                    superset_ctx.client.cookies.set(name, value)
+            except Exception as e:
+                logger.debug("Could not set cookies from login response: %s", e)
 
         # Get CSRF token after successful authentication
         await get_csrf_token(ctx)
@@ -504,20 +593,69 @@ async def superset_auth_authenticate_user(
 # ===== Dashboard Tools =====
 
 
+# When dashboard/chart list is empty despite dashboards existing in UI (Superset bug)
+DASHBOARD_EMPTY_HINT = (
+    "_diagnostic: If you have dashboards in the Superset UI but API returns count 0, "
+    "this is a known Superset issue (apache/superset#25890). Fix: In Superset go to "
+    "Settings → List Roles → Public → Edit, and REMOVE 'can read on Dashboard' and "
+    "'can read on Chart' from the Public role. Do not add these permissions to Public."
+)
+
+
+def _normalize_dashboard_list_response(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize dashboard list API response for 4.x–6.x and clearer LLM consumption.
+    API returns { count, ids?, result? }; ensure 'dashboards' and 'count' are explicit.
+    """
+    if not data or not isinstance(data, dict):
+        return data
+    out = dict(data)
+    # Expose result array as 'dashboards' so assistants clearly see the list
+    if "result" in data and isinstance(data["result"], list):
+        out["dashboards"] = data["result"]
+    elif "ids" in data and isinstance(data["ids"], list) and "dashboards" not in out:
+        out["dashboards"] = [{"id": i} for i in data["ids"]]
+    if "count" not in out and "dashboards" in out:
+        out["count"] = len(out["dashboards"])
+    if out.get("count") == 0 and (not out.get("dashboards") or len(out.get("dashboards", [])) == 0):
+        out["_hint"] = DASHBOARD_EMPTY_HINT
+    return out
+
+
 @mcp.tool()
 @requires_auth
 @handle_api_errors
-async def superset_dashboard_list(ctx: Context) -> Dict[str, Any]:
+async def superset_dashboard_list(
+    ctx: Context, page_size: int = 100
+) -> Dict[str, Any]:
     """
     Get a list of dashboards from Superset
 
-    Makes a request to the /api/v1/dashboard/ endpoint to retrieve all dashboards
-    the current user has access to view. Results are paginated.
+    Makes a request to the /api/v1/dashboard/ endpoint to retrieve dashboards
+    the current user has access to view. Uses pagination (page_size) so results
+    are not limited to the default 20.
+
+    Args:
+        page_size: Number of dashboards to return per page (default 100). Use a larger value to see more.
 
     Returns:
-        A dictionary containing dashboard data including id, title, url, and metadata
+        A dictionary with 'count', 'dashboards' (array of dashboard objects with id, dashboard_title, url, etc.), and raw API fields.
+        If count is 0 but the user has dashboards in the UI, the response may include _hint about Superset Public role permissions (see apache/superset#25890).
     """
-    return await make_api_request(ctx, "get", "/api/v1/dashboard/")
+    # Superset list API requires pagination via 'q'. Default page_size=20 can truncate or confuse clients.
+    page_size = max(1, min(page_size, 1000))
+    # Try JSON first (Superset 6.x), then Rison (page:0,page_size:N) for older versions
+    for q_val in (
+        json.dumps({"page": 0, "page_size": page_size}),
+        f"(page:0,page_size:{page_size})",
+    ):
+        result = await make_api_request(
+            ctx, "get", "/api/v1/dashboard/", params={"q": q_val}
+        )
+        if isinstance(result, dict) and "error" not in result:
+            return _normalize_dashboard_list_response(result)
+        # If error (e.g. 400 for unsupported q format), try next format
+    return result if isinstance(result, dict) else {"error": "Failed to list dashboards"}
 
 
 @mcp.tool()
@@ -1840,5 +1978,33 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Superset MCP server (compatible with Superset 4.x–6.x)"
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http", "sse"],
+        default="stdio",
+        help="Transport: stdio (default, for Claude Desktop), http (Streamable HTTP), sse (legacy SSE)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for http/sse transport (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port for http/sse transport (default: 8000)",
+    )
+    args = parser.parse_args()
+
     logger.info("Starting Superset MCP server...")
-    mcp.run()
+    if args.transport == "stdio":
+        mcp.run()
+    else:
+        # MCP SDK expects "streamable-http" or "sse", not "http"
+        sdk_transport = "streamable-http" if args.transport == "http" else args.transport
+        logger.info(f"Listening on {sdk_transport} at http://{args.host}:{args.port}")
+        mcp.run(transport=sdk_transport)

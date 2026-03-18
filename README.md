@@ -54,6 +54,40 @@ npx -y @smithery/cli install @aptro/superset-mcp --client claude
    mcp install main.py
    ```
 
+### Verifying the HTTP server
+
+With the server running via HTTP (`python main.py --transport http`), the MCP endpoint is at **http://127.0.0.1:8000/mcp**. You can sanity-check it with:
+
+```bash
+# Optional: check that something is listening
+curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/mcp
+# 405 Method Not Allowed is normal for GET; the endpoint expects POST.
+```
+
+### Kimi CLI (HTTP)
+
+To use the Superset MCP server with [Kimi CLI](https://moonshotai.github.io/kimi-cli/) over HTTP:
+
+1. Start the server in HTTP mode:
+   ```bash
+   python main.py --transport http
+   ```
+
+2. Add the MCP server in Kimi CLI (Streamable HTTP endpoint is `/mcp`):
+   ```bash
+   kimi mcp add --transport http superset http://127.0.0.1:8000/mcp
+   ```
+
+3. List and test the connection:
+   ```bash
+   kimi mcp list
+   kimi mcp test superset
+   ```
+
+4. Use Kimi CLI as usual; the `superset` MCP server will be available in your session.
+
+To remove the server later: `kimi mcp remove superset`.
+
 ## Usage with Claude
 
 After setup, you can interact with your Superset instance via Claude using natural language requests. Here are some examples:
@@ -218,6 +252,7 @@ This plugin offers the following MCP tools that Claude can use:
 - Make sure Superset is running and accessible at the URL specified in your `.env` file
 - Check that you're using a compatible version of Superset (tested with version 4.1.1)
 - Ensure the port used by the MCP server is not being used by another application
+- **Dashboard/Chart list returns 0 items but you have dashboards in the UI**: This is a [known Superset issue](https://github.com/apache/superset/issues/25890). In Superset go to **Settings → List Roles → Public → Edit** and **remove** the permissions "can read on Dashboard" and "can read on Chart" from the **Public** role. Do not add these permissions to the Public role; use a custom role for guests if needed.
 
 ## Security Notes
 
