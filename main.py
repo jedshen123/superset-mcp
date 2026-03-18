@@ -211,11 +211,17 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
         await client.aclose()
 
 
+# HTTP bind address: set FASTMCP_HOST=0.0.0.0 on server so Kimi/other clients can connect remotely
+MCP_HOST = os.getenv("FASTMCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.getenv("FASTMCP_PORT", "8000"))
+
 # Initialize FastMCP server with lifespan and dependencies
 mcp = FastMCP(
     "superset",
     lifespan=superset_lifespan,
     dependencies=["fastapi", "uvicorn", "python-dotenv", "httpx"],
+    host=MCP_HOST,
+    port=MCP_PORT,
 )
 
 # Type variables for generic function annotations
