@@ -244,3 +244,9 @@ sudo systemctl restart superset-mcp
    ```
    - 能连上：通常返回 405（Method Not Allowed）为正常。  
    - 超时或 connection refused：检查上面 1、2 步和服务器是否在跑、端口是否一致。
+
+4. **按用户鉴权（HTTP Basic Auth，可选）**  
+   - **不传 Basic Auth**：使用服务器 `.env` 里的默认 Superset 账号，Kimi 只需 `kimi mcp add --transport http superset http://服务器:8000/mcp`。  
+   - **传 Basic Auth**：按用户切换 Superset 账号（将 `user` / `pass` 换成实际账号）：  
+     `kimi mcp add --transport http superset http://服务器:8000/mcp --header "Authorization: Basic $(echo -n 'user:pass' | base64)"`  
+   - 若请求里带了 Basic 但 Superset 登录失败，返回 401。

@@ -88,6 +88,21 @@ To use the Superset MCP server with [Kimi CLI](https://moonshotai.github.io/kimi
 
 To remove the server later: `kimi mcp remove superset`.
 
+#### Per-user Superset credentials (HTTP Basic Auth)
+
+When the MCP server is running over HTTP, you can use **different Superset accounts per client** by sending HTTP Basic Auth. The username and password are your **Superset** login (not the MCP server).
+
+- **Kimi CLI**: add the server with `--header` to pass Basic Auth (Kimi may support a dedicated auth option; otherwise configure the URL to include credentials or use a header):
+  ```bash
+  # If your Kimi supports passing auth, use Superset username and password as the credentials.
+  # Example (syntax depends on Kimi version): pass Authorization: Basic base64(username:password)
+  kimi mcp add --transport http superset http://your-server:8000/mcp --header "Authorization: Basic $(echo -n 'superset_username:superset_password' | base64)"
+  ```
+- **特殊字符**：按 HTTP Basic Auth 规范，**第一个**冒号用来分隔「用户名」和「密码」，因此密码里可以包含冒号 `:`，会正确解析；用户名中不要包含冒号。若密码含引号等，在 shell 里请用单引号包裹并确保使用 `echo -n`（避免换行被编进 base64）。
+- Or configure in `~/.kimi/mcp.json` with a `headers` entry that includes the Basic auth header (replace the base64 string with your Superset user:pass in base64).
+- **不带 Basic Auth**：使用服务器 `.env` 中的 `SUPERSET_USERNAME` / `SUPERSET_PASSWORD`（与 lifespan 一致）；Kimi 可只配置 URL，无需 `--header`。
+- **带了 Basic Auth 但账号密码错误**：返回 401。
+
 ## Usage with Claude
 
 After setup, you can interact with your Superset instance via Claude using natural language requests. Here are some examples:

@@ -10,6 +10,8 @@ from typing import (
     Union,
 )
 import argparse
+import base64
+import contextvars
 import os
 import httpx
 from contextlib import asynccontextmanager
@@ -73,6 +75,11 @@ AUTH_PROVIDER = "db"
 # Initialize FastAPI app for handling additional web endpoints if needed
 app = FastAPI(title="Superset MCP Server")
 
+# Request-scoped Superset context when using HTTP Basic Auth (per-user Superset credentials)
+_current_request_superset_context: contextvars.ContextVar[Optional["SupersetContext"]] = (
+    contextvars.ContextVar("current_request_superset_context", default=None)
+)
+
 
 @dataclass
 class SupersetContext:
@@ -105,19 +112,40 @@ def save_access_token(token: str):
         logger.warning(f"Warning: Could not save access token: {e}")
 
 
+def get_effective_superset_context(ctx: Context) -> SupersetContext:
+    """
+    Return the Superset context for this request.
+    When HTTP Basic Auth is used, returns the per-request context (that user's Superset token).
+    Otherwise returns the lifespan context (.env or stored token).
+    """
+    try:
+        request_ctx = _current_request_superset_context.get()
+        if request_ctx is not None:
+            return request_ctx
+    except LookupError:
+        pass
+    return ctx.request_context.lifespan_context
+
+
 def ensure_token_loaded(ctx: Context) -> None:
     """
     If the current context has no access token, try loading from disk.
     HTTP/streamable-http mode may use a new session per request, so in-memory
     token from a previous authenticate_user call can be missing; loading from
-    file keeps auth valid across tool calls.
+    file keeps auth valid across tool calls. Skipped when using HTTP Basic Auth (per-request context).
     """
     try:
-        superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+        superset_ctx = get_effective_superset_context(ctx)
     except (LookupError, AttributeError):
         return
     if superset_ctx.access_token:
         return
+    try:
+        request_ctx = _current_request_superset_context.get()
+        if request_ctx is not None:
+            return  # HTTP Basic Auth context has no disk token to load
+    except LookupError:
+        pass
     stored = load_stored_token()
     if not stored:
         return
@@ -239,7 +267,7 @@ def requires_auth(
     @wraps(func)
     async def wrapper(ctx: Context, *args, **kwargs) -> Dict[str, Any]:
         ensure_token_loaded(ctx)
-        superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+        superset_ctx = get_effective_superset_context(ctx)
 
         if not superset_ctx.access_token:
             return {"error": "Not authenticated. Please authenticate first."}
@@ -280,7 +308,7 @@ async def with_auto_refresh(
         ctx: The MCP context
         api_call: The API call function to execute (should be a callable that returns a response)
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
 
     if not superset_ctx.access_token:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -329,7 +357,7 @@ async def get_csrf_token(ctx: Context) -> Optional[str]:
     Args:
         ctx: MCP context
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
     client = superset_ctx.client
 
     try:
@@ -369,7 +397,7 @@ async def make_api_request(
         auto_refresh: Whether to auto-refresh token on 401
     """
     ensure_token_loaded(ctx)
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
     client = superset_ctx.client
 
     # For non-GET requests, make sure we have a CSRF token
@@ -431,7 +459,7 @@ async def superset_auth_check_token_validity(ctx: Context) -> Dict[str, Any]:
     Returns:
         A dictionary with token validity status and any error information
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
 
     if not superset_ctx.access_token:
         return {"valid": False, "error": "No access token available"}
@@ -464,7 +492,7 @@ async def superset_auth_refresh_token(ctx: Context) -> Dict[str, Any]:
     Returns:
         A dictionary with the new access token or error information
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
 
     if not superset_ctx.access_token:
         return {"error": "No access token to refresh. Please authenticate first."}
@@ -520,7 +548,7 @@ async def superset_auth_authenticate_user(
     Returns:
         A dictionary with authentication status and access token or error information
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
 
     # If we already have a token, check if it's valid
     if superset_ctx.access_token:
@@ -1329,7 +1357,7 @@ async def superset_sqllab_execute_query(
         A dictionary with query results or execution status for async queries
     """
     # Ensure we have a CSRF token before executing the query
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
     if not superset_ctx.csrf_token:
         await get_csrf_token(ctx)
 
@@ -1453,7 +1481,7 @@ async def superset_sqllab_export_query_results(
     Returns:
         A dictionary with the exported data or error information
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
 
     try:
         response = await superset_ctx.client.get(f"/api/v1/sqllab/export/{client_id}")
@@ -1927,7 +1955,7 @@ async def superset_config_get_base_url(ctx: Context) -> Dict[str, Any]:
     Returns:
         A dictionary with the Superset base URL
     """
-    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    superset_ctx = get_effective_superset_context(ctx)
 
     return {
         "base_url": superset_ctx.base_url,
@@ -1983,6 +2011,159 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
 
 
+# ===== HTTP Basic Auth: per-request Superset credentials =====
+
+
+async def _login_superset_and_create_context(username: str, password: str) -> Optional[SupersetContext]:
+    """
+    Log in to Superset with the given credentials and return a SupersetContext.
+    Used by HTTP Basic Auth middleware; token is not persisted to disk.
+    """
+    client = httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=30.0)
+    try:
+        response = await client.post(
+            SECURITY_LOGIN_ENDPOINT,
+            json={
+                "username": username,
+                "password": password,
+                "provider": AUTH_PROVIDER,
+                "refresh": True,
+            },
+        )
+        if response.status_code != 200:
+            logger.warning("HTTP Basic Auth: Superset login failed for user %s: %s", username, response.status_code)
+            return None
+        data = response.json()
+        access_token = _normalize_access_token_response(data)
+        if not access_token:
+            return None
+        client.headers.update({"Authorization": f"Bearer {access_token}"})
+        ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
+        ctx.access_token = access_token
+        # Get CSRF for later POST/PUT/DELETE
+        try:
+            r = await client.get(SECURITY_CSRF_ENDPOINT)
+            if r.status_code == 200:
+                ctx.csrf_token = _normalize_csrf_response(r.json())
+        except Exception:
+            pass
+        return ctx
+    except Exception as e:
+        logger.warning("HTTP Basic Auth: Superset login error for user %s: %s", username, e)
+        await client.aclose()
+        return None
+
+
+async def _send_401_require_basic_auth(send: Any) -> None:
+    """Send 401 when Basic Auth was sent but invalid; omit Basic to use .env defaults."""
+    body = (
+        b'{"error":"Invalid Superset credentials in Authorization Basic. '
+        b'Omit Basic Auth to use SUPERSET_USERNAME/SUPERSET_PASSWORD from server .env."}'
+    )
+    await send({
+        "type": "http.response.start",
+        "status": 401,
+        "headers": [
+            [b"www-authenticate", b'Basic realm="Superset MCP"'],
+            [b"content-type", b"application/json"],
+            [b"content-length", str(len(body)).encode()],
+        ],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+async def _superset_basic_auth_middleware(scope: dict, receive: Any, send: Any, next_app: Any) -> None:
+    """
+    ASGI middleware: optional Authorization: Basic (Superset username:password).
+    If present and valid, use per-request Superset context. If omitted, use lifespan / .env default credentials.
+    If Basic is present but invalid, return 401.
+    Do not close the request client in finally: MCP may run the tool after next_app returns.
+    Close the previous request's client when a new request starts.
+    """
+    # Close previous request's client (if any) when this request starts, so we don't close the current one in finally
+    try:
+        prev = _current_request_superset_context.get()
+        if isinstance(prev, SupersetContext) and prev.client:
+            await prev.client.aclose()
+    except LookupError:
+        pass
+    _current_request_superset_context.set(None)
+    try:
+        if scope.get("type") == "http":
+            method = scope.get("method", "?").upper()
+            path = scope.get("path", "?")
+            auth_header = None
+            for name, value in scope.get("headers", []):
+                if name.lower() == b"authorization" and value.startswith(b"Basic "):
+                    auth_header = value
+                    break
+            logger.info("MCP request: %s %s has_basic_auth=%s", method, path, auth_header is not None)
+            if auth_header:
+                try:
+                    # Decode Base64; strip padding/whitespace so trailing padding does not break decoding
+                    b64 = auth_header[6:].strip()
+                    pad = 4 - (len(b64) % 4)
+                    if 0 < pad < 4:
+                        b64 = b64 + b"=" * pad
+                    raw = base64.b64decode(b64, validate=True).decode("utf-8")
+                    # Per RFC 7617: first colon separates username from password. Password may contain colons.
+                    if ":" not in raw:
+                        await _send_401_require_basic_auth(send)
+                        return
+                    sup_user, sup_pass = raw.split(":", 1)
+                    sup_user = sup_user.strip()
+                    sup_pass = sup_pass.strip()
+                    if not sup_user or not sup_pass:
+                        await _send_401_require_basic_auth(send)
+                        return
+                    request_ctx = await _login_superset_and_create_context(sup_user, sup_pass)
+                    if request_ctx is None:
+                        logger.warning("MCP request rejected: Superset login failed for user %s", sup_user)
+                        await _send_401_require_basic_auth(send)
+                        return
+                    _current_request_superset_context.set(request_ctx)
+                    logger.info("HTTP Basic Auth: using Superset user %s for this request", sup_user)
+                except Exception as e:
+                    logger.warning("HTTP Basic Auth error: %s", e)
+                    await _send_401_require_basic_auth(send)
+                    return
+            else:
+                logger.info("MCP request: no Basic Auth, using default .env / lifespan Superset context")
+            # MCP Streamable HTTP only accepts POST; GET returns 404 from the SDK. Return 405 with a clear message.
+            path_normalized = (scope.get("path") or "").rstrip("/") or "/"
+            if path_normalized == "/mcp" and method == "GET":
+                body = b'{"message":"MCP endpoint accepts POST only. Use POST with JSON-RPC for tool calls."}'
+                await send({
+                    "type": "http.response.start",
+                    "status": 405,
+                    "headers": [[b"content-type", b"application/json"], [b"content-length", str(len(body)).encode()]],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        logger.info("MCP request: auth OK, forwarding to MCP app")
+        try:
+            await next_app(scope, receive, send)
+        except Exception as e:
+            logger.exception("MCP app error: %s", e)
+            raise
+    finally:
+        # Do NOT close the client or reset the context here: MCP may invoke the tool after next_app returns.
+        # The next request will close this request's client at the start of the middleware.
+        pass
+
+
+def _wrap_app_with_superset_basic_auth(asgi_app: Any) -> Any:
+    """Wrap the MCP ASGI app so that HTTP requests can carry Superset credentials via Basic Auth."""
+
+    async def wrapped(scope: dict, receive: Any, send: Any) -> None:
+        if scope.get("type") == "lifespan":
+            await asgi_app(scope, receive, send)
+            return
+        await _superset_basic_auth_middleware(scope, receive, send, asgi_app)
+
+    return wrapped
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Superset MCP server (compatible with Superset 4.x–6.x)"
@@ -2009,8 +2190,17 @@ if __name__ == "__main__":
     logger.info("Starting Superset MCP server...")
     if args.transport == "stdio":
         mcp.run()
+    elif args.transport == "http":
+        # Wrap with Basic Auth middleware so clients can send Superset username:password via HTTP Basic
+        starlette_app = mcp.streamable_http_app()
+        wrapped_app = _wrap_app_with_superset_basic_auth(starlette_app)
+        logger.info(
+            "Listening on streamable-http at http://%s:%s (HTTP Basic Auth = Superset username:password)",
+            MCP_HOST,
+            MCP_PORT,
+        )
+        uvicorn.run(wrapped_app, host=MCP_HOST, port=MCP_PORT, log_level="info")
     else:
-        # MCP SDK expects "streamable-http" or "sse", not "http"
-        sdk_transport = "streamable-http" if args.transport == "http" else args.transport
+        sdk_transport = "sse"
         logger.info(f"Listening on {sdk_transport} at http://{args.host}:{args.port}")
         mcp.run(transport=sdk_transport)
