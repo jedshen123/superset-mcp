@@ -387,7 +387,8 @@ async def _fetch_csrf_for_context(superset_ctx: SupersetContext) -> Tuple[Option
 
     Returns (token, "") on success, or (None, diagnostic) on failure. The diagnostic
     includes HTTP status and response body snippets so operators can see 401 vs 403
-    vs HTML error pages.
+    vs HTML error pages. Redirects (301/302/307/308) are followed so FAB trailing-slash
+    rules do not return an HTML redirect page instead of JSON.
 
     Superset ties CSRF validation to the session cookie jar; the same AsyncClient
     must perform this GET and the subsequent POST. The token is also set on
@@ -406,7 +407,9 @@ async def _fetch_csrf_for_context(superset_ctx: SupersetContext) -> Tuple[Option
     )
     for path in _csrf_paths_to_try():
         try:
-            response = await client.get(path, headers=extra_headers)
+            response = await client.get(
+                path, headers=extra_headers, follow_redirects=True
+            )
         except Exception as e:
             last_err = f"GET {path!r} failed: {e}"
             logger.warning("CSRF fetch: %s", last_err)
