@@ -3,6 +3,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     AsyncIterator,
     Callable,
     TypeVar,
@@ -359,9 +360,34 @@ async def with_auto_refresh(
     return await api_call()
 
 
-async def _fetch_csrf_for_context(superset_ctx: SupersetContext) -> Optional[str]:
+def _csrf_paths_to_try() -> List[str]:
+    """Trailing slash varies by proxy/FAB config; try both."""
+    root = SECURITY_CSRF_ENDPOINT.rstrip("/")
+    ordered = [root + "/", root]
+    seen = set()
+    out: List[str] = []
+    for p in ordered:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _csrf_failure_suggests_reauth(detail: str) -> bool:
+    return "HTTP 401" in detail or " 401 " in detail
+
+
+def _csrf_failure_suggests_forbidden(detail: str) -> bool:
+    return "HTTP 403" in detail or " 403 " in detail
+
+
+async def _fetch_csrf_for_context(superset_ctx: SupersetContext) -> Tuple[Optional[str], str]:
     """
     Fetch a CSRF token from Superset and attach it to the shared httpx client.
+
+    Returns (token, "") on success, or (None, diagnostic) on failure. The diagnostic
+    includes HTTP status and response body snippets so operators can see 401 vs 403
+    vs HTML error pages.
 
     Superset ties CSRF validation to the session cookie jar; the same AsyncClient
     must perform this GET and the subsequent POST. The token is also set on
@@ -369,33 +395,112 @@ async def _fetch_csrf_for_context(superset_ctx: SupersetContext) -> Optional[str
     """
     client = superset_ctx.client
 
-    try:
-        response = await client.get(SECURITY_CSRF_ENDPOINT)
-        if response.status_code == 200:
-            data = response.json()
-            csrf_token = _normalize_csrf_response(data)
-            superset_ctx.csrf_token = csrf_token
-            if csrf_token:
-                client.headers["X-CSRFToken"] = csrf_token
-            else:
-                client.headers.pop("X-CSRFToken", None)
-                logger.warning("CSRF endpoint returned 200 but no parseable token: %s", data)
-            return csrf_token
-        else:
-            logger.warning(
-                "Failed to get CSRF token: %s - %s",
-                response.status_code,
-                response.text[:1000],
+    if superset_ctx.access_token:
+        client.headers["Authorization"] = f"Bearer {superset_ctx.access_token}"
+
+    extra_headers = {"Accept": "application/json"}
+
+    last_err = (
+        "No CSRF URL returned HTTP 200 with a parseable token. "
+        f"Tried: {_csrf_paths_to_try()}"
+    )
+    for path in _csrf_paths_to_try():
+        try:
+            response = await client.get(path, headers=extra_headers)
+        except Exception as e:
+            last_err = f"GET {path!r} failed: {e}"
+            logger.warning("CSRF fetch: %s", last_err)
+            continue
+
+        if response.status_code != 200:
+            last_err = (
+                f"GET {path!r} -> HTTP {response.status_code}. "
+                f"Body (truncated): {response.text[:1500]}"
             )
-            return None
-    except Exception as e:
-        logger.warning("Error getting CSRF token: %s", e)
-        return None
+            logger.warning("CSRF fetch: %s", last_err)
+            continue
+
+        try:
+            data = response.json()
+        except Exception as e:
+            last_err = (
+                f"GET {path!r} returned HTTP 200 but body is not JSON "
+                f"(content-type={response.headers.get('content-type')!r}): "
+                f"{response.text[:800]!r}. Parse error: {e}"
+            )
+            logger.warning("CSRF fetch: %s", last_err)
+            continue
+
+        csrf_token = _normalize_csrf_response(data)
+        if csrf_token:
+            superset_ctx.csrf_token = csrf_token
+            client.headers["X-CSRFToken"] = csrf_token
+            return csrf_token, ""
+
+        last_err = (
+            f"GET {path!r} returned JSON but no CSRF string could be parsed: {data!r}"
+        )
+        logger.warning("CSRF fetch: %s", last_err)
+
+    superset_ctx.csrf_token = None
+    client.headers.pop("X-CSRFToken", None)
+    return None, last_err
 
 
 async def get_csrf_token(ctx: Context) -> Optional[str]:
     """Fetch CSRF token for the current MCP request's Superset context."""
-    return await _fetch_csrf_for_context(get_effective_superset_context(ctx))
+    token, _ = await _fetch_csrf_for_context(get_effective_superset_context(ctx))
+    return token
+
+
+async def _ensure_csrf_for_mutation(ctx: Context) -> Optional[str]:
+    """
+    Ensure a CSRF token is available for POST/PUT/DELETE.
+
+    Returns None on success, or an error string for the tool response on failure.
+    On HTTP 401 from the CSRF endpoint, tries JWT refresh then optional re-login
+    using env credentials (same as superset_auth_authenticate_user).
+    """
+    superset_ctx = get_effective_superset_context(ctx)
+    token, detail = await _fetch_csrf_for_context(superset_ctx)
+    if token:
+        return None
+
+    if _csrf_failure_suggests_reauth(detail):
+        refresh_result = await superset_auth_refresh_token(ctx)
+        if not refresh_result.get("error"):
+            token, detail = await _fetch_csrf_for_context(superset_ctx)
+            if token:
+                return None
+        # Refresh alone often does not issue a new Flask session; CSRF may still 401 until
+        # POST /login runs (force_login bypasses "Already authenticated" when /me still works).
+        if SUPERSET_USERNAME and SUPERSET_PASSWORD:
+            auth_result = await superset_auth_authenticate_user(
+                ctx,
+                username=SUPERSET_USERNAME,
+                password=SUPERSET_PASSWORD,
+                force_login=True,
+            )
+            if not auth_result.get("error"):
+                token, detail = await _fetch_csrf_for_context(superset_ctx)
+                if token:
+                    return None
+
+    extra = ""
+    if _csrf_failure_suggests_forbidden(detail):
+        extra = (
+            " Hint: the JWT user may lack permission to call GET /api/v1/security/csrf_token/ "
+            "(Flask-AppBuilder protect() on that route). Ask an admin to grant the role "
+            "access to the Security API / CSRF endpoint."
+        )
+    elif _csrf_failure_suggests_reauth(detail):
+        extra = (
+            " Hint: set SUPERSET_USERNAME and SUPERSET_PASSWORD on the MCP server so a forced "
+            f"re-login can run, or call superset_auth_authenticate_user(..., force_login=True). "
+            f"You can also delete {ACCESS_TOKEN_STORE_PATH} and authenticate again."
+        )
+
+    return f"Could not obtain CSRF token from Superset. Detail: {detail}{extra}"
 
 
 async def make_api_request(
@@ -423,15 +528,9 @@ async def make_api_request(
 
     # Mutating requests need a fresh CSRF token in the same cookie session as the POST.
     if method.lower() != "get":
-        await get_csrf_token(ctx)
-        if not superset_ctx.csrf_token:
-            return {
-                "error": (
-                    "Could not obtain CSRF token from Superset (GET "
-                    f"{SECURITY_CSRF_ENDPOINT}). Ensure the access token is valid and "
-                    "the Superset API is reachable. Without X-CSRFToken, POST requests are rejected."
-                )
-            }
+        csrf_err = await _ensure_csrf_for_mutation(ctx)
+        if csrf_err:
+            return {"error": csrf_err}
 
     async def make_request() -> httpx.Response:
         headers = {}
@@ -575,6 +674,7 @@ async def superset_auth_authenticate_user(
     username: Optional[str] = None,
     password: Optional[str] = None,
     refresh: bool = True,
+    force_login: bool = False,
 ) -> Dict[str, Any]:
     """
     Authenticate with Superset and get access token
@@ -587,6 +687,9 @@ async def superset_auth_authenticate_user(
         username: Superset username (falls back to environment variable if not provided)
         password: Superset password (falls back to environment variable if not provided)
         refresh: Whether to refresh the token if invalid (defaults to True)
+        force_login: If True, skip the "already logged in" shortcut and POST /login again.
+            Use this when the JWT is accepted by /me but CSRF still returns 401 — a full login
+            establishes the Flask session cookie that pairs with generate_csrf().
 
     Returns:
         A dictionary with authentication status and access token or error information
@@ -594,7 +697,7 @@ async def superset_auth_authenticate_user(
     superset_ctx = get_effective_superset_context(ctx)
 
     # If we already have a token, check if it's valid
-    if superset_ctx.access_token:
+    if not force_login and superset_ctx.access_token:
         validity = await superset_auth_check_token_validity(ctx)
 
         if validity.get("valid"):
@@ -2084,7 +2187,9 @@ async def _login_superset_and_create_context(username: str, password: str) -> Op
                 logger.debug("HTTP Basic: could not set cookies from login: %s", e)
         ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
         ctx.access_token = access_token
-        await _fetch_csrf_for_context(ctx)
+        _token, csrf_err = await _fetch_csrf_for_context(ctx)
+        if not _token:
+            logger.warning("HTTP Basic Auth: CSRF fetch failed for user %s: %s", username, csrf_err)
         return ctx
     except Exception as e:
         logger.warning("HTTP Basic Auth: Superset login error for user %s: %s", username, e)
