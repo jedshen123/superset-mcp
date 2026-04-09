@@ -173,14 +173,22 @@ def _normalize_access_token_response(data: Dict[str, Any]) -> Optional[str]:
 def _normalize_csrf_response(data: Dict[str, Any]) -> Optional[str]:
     """
     Extract CSRF token from response.
-    Handles both { "result": "token" } and { "csrf_token": "token" } or raw string result.
+    Handles { "result": "token" }, nested dict result, or top-level csrf_token.
     """
     if not data:
         return None
     token = data.get("result")
     if token is not None:
-        return str(token) if not isinstance(token, dict) else token.get("csrf_token")
-    return data.get("csrf_token")
+        if isinstance(token, dict):
+            token = token.get("csrf_token") or token.get("token")
+        if token is not None:
+            s = str(token).strip()
+            return s if s else None
+    top = data.get("csrf_token")
+    if top is not None:
+        s = str(top).strip()
+        return s if s else None
+    return None
 
 
 def _normalize_api_response(data: Any) -> Any:
@@ -344,20 +352,21 @@ async def with_auto_refresh(
             # If re-authentication failed, raise an exception
             raise HTTPException(status_code=401, detail="Authentication failed")
 
+    # New JWT may need a fresh CSRF bound to the same cookie session
+    await _fetch_csrf_for_context(superset_ctx)
+
     # Retry the API call with the new token
     return await api_call()
 
 
-async def get_csrf_token(ctx: Context) -> Optional[str]:
+async def _fetch_csrf_for_context(superset_ctx: SupersetContext) -> Optional[str]:
     """
-    Get a CSRF token from Superset
+    Fetch a CSRF token from Superset and attach it to the shared httpx client.
 
-    Makes a request to the /api/v1/security/csrf_token endpoint to get a token
-
-    Args:
-        ctx: MCP context
+    Superset ties CSRF validation to the session cookie jar; the same AsyncClient
+    must perform this GET and the subsequent POST. The token is also set on
+    client.headers["X-CSRFToken"] so every mutating request includes it.
     """
-    superset_ctx = get_effective_superset_context(ctx)
     client = superset_ctx.client
 
     try:
@@ -366,15 +375,27 @@ async def get_csrf_token(ctx: Context) -> Optional[str]:
             data = response.json()
             csrf_token = _normalize_csrf_response(data)
             superset_ctx.csrf_token = csrf_token
+            if csrf_token:
+                client.headers["X-CSRFToken"] = csrf_token
+            else:
+                client.headers.pop("X-CSRFToken", None)
+                logger.warning("CSRF endpoint returned 200 but no parseable token: %s", data)
             return csrf_token
         else:
-            logger.info(
-                f"Failed to get CSRF token: {response.status_code} - {response.text}"
+            logger.warning(
+                "Failed to get CSRF token: %s - %s",
+                response.status_code,
+                response.text[:1000],
             )
             return None
     except Exception as e:
-        logger.info(f"Error getting CSRF token: {str(e)}")
+        logger.warning("Error getting CSRF token: %s", e)
         return None
+
+
+async def get_csrf_token(ctx: Context) -> Optional[str]:
+    """Fetch CSRF token for the current MCP request's Superset context."""
+    return await _fetch_csrf_for_context(get_effective_superset_context(ctx))
 
 
 async def make_api_request(
@@ -400,14 +421,22 @@ async def make_api_request(
     superset_ctx = get_effective_superset_context(ctx)
     client = superset_ctx.client
 
-    # For non-GET requests, make sure we have a CSRF token
-    if method.lower() != "get" and not superset_ctx.csrf_token:
+    # Mutating requests need a fresh CSRF token in the same cookie session as the POST.
+    if method.lower() != "get":
         await get_csrf_token(ctx)
+        if not superset_ctx.csrf_token:
+            return {
+                "error": (
+                    "Could not obtain CSRF token from Superset (GET "
+                    f"{SECURITY_CSRF_ENDPOINT}). Ensure the access token is valid and "
+                    "the Superset API is reachable. Without X-CSRFToken, POST requests are rejected."
+                )
+            }
 
     async def make_request() -> httpx.Response:
         headers = {}
 
-        # Add CSRF token for non-GET requests
+        # Redundant with client.headers but keeps behavior explicit for proxies
         if method.lower() != "get" and superset_ctx.csrf_token:
             headers["X-CSRFToken"] = superset_ctx.csrf_token
 
@@ -430,6 +459,20 @@ async def make_api_request(
         if auto_refresh
         else await make_request()
     )
+
+    # One retry: stale session vs. CSRF (e.g. after token refresh without new CSRF)
+    if (
+        response.status_code == 400
+        and method.lower() != "get"
+        and "csrf" in (response.text or "").lower()
+    ):
+        await get_csrf_token(ctx)
+        if superset_ctx.csrf_token:
+            response = (
+                await with_auto_refresh(ctx, make_request)
+                if auto_refresh
+                else await make_request()
+            )
 
     if response.status_code not in [200, 201]:
         return {
@@ -1356,11 +1399,6 @@ async def superset_sqllab_execute_query(
     Returns:
         A dictionary with query results or execution status for async queries
     """
-    # Ensure we have a CSRF token before executing the query
-    superset_ctx = get_effective_superset_context(ctx)
-    if not superset_ctx.csrf_token:
-        await get_csrf_token(ctx)
-
     payload = {
         "database_id": database_id,
         "sql": sql,
@@ -2038,15 +2076,15 @@ async def _login_superset_and_create_context(username: str, password: str) -> Op
         if not access_token:
             return None
         client.headers.update({"Authorization": f"Bearer {access_token}"})
+        if getattr(response, "cookies", None):
+            try:
+                for name, value in response.cookies.items():
+                    client.cookies.set(name, value)
+            except Exception as e:
+                logger.debug("HTTP Basic: could not set cookies from login: %s", e)
         ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
         ctx.access_token = access_token
-        # Get CSRF for later POST/PUT/DELETE
-        try:
-            r = await client.get(SECURITY_CSRF_ENDPOINT)
-            if r.status_code == 200:
-                ctx.csrf_token = _normalize_csrf_response(r.json())
-        except Exception:
-            pass
+        await _fetch_csrf_for_context(ctx)
         return ctx
     except Exception as e:
         logger.warning("HTTP Basic Auth: Superset login error for user %s: %s", username, e)
